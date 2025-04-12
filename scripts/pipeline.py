@@ -4,8 +4,9 @@
 import argparse
 import os
 import logging
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import cv2
 import numpy as np
@@ -155,21 +156,39 @@ def main():
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--reference", required=True)
+    parser.add_argument("--coco_input", required=True)
     parser.add_argument("--log_level", default="INFO")
     parser.add_argument("--max_workers", type=int, default=1)
     args = parser.parse_args()
 
     logger = setup_logger(args.log_level)
-    logger.info("pipe start...")
+    logger.info("Pipeline starting...")
+
+    with open(args.coco_input, 'r') as f:
+        coco_data: Dict[str, Any] = json.load(f)
+
+    coco_imgs: List[Dict[str, Any]] = coco_data['images']
+    coco_ann: List[Dict[str, Any]] = coco_data['annotations']
+    
+    filt_imgs: List[Dict[str, Any]] = []
+    _dis: set = set()
+
+    for img_info in coco_imgs:
+        img_path = os.path.join(args.input_dir, img_info['file_name'])
+        if os.path.isfile(img_path):
+            filt_imgs.append(img_info)
+            _dis.add(img_info['id'])
+
+    filtered_annotations: List[Dict[str, Any]] = [
+        anno for anno in coco_ann if anno['image_id'] in _dis
+    ]
+
+    input_files: List[str] = [img['file_name'] for img in filt_imgs]
     reference_image = sitk.ReadImage(args.reference)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    input_files = [
-        f for f in os.listdir(args.input_dir)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ]
-
+    succ_img: set = set()
     n = 0
 
     if args.max_workers > 1:
@@ -183,19 +202,35 @@ def main():
             for future in as_completed(futures):
                 file_name = futures[future]
                 try:
-                    result = future.result()
-                    if result:
+                    if future.result():
+                        succ_img.add(file_name)
                         n += 1
                 except Exception as e:
-                    logger.error(f"err {file_name}: {str(e)}")
-                    continue
+                    logger.error(f"err proccess {file_name}: {str(e)}")
     else:
         for f in input_files:
-            input_path = os.path.join(args.input_dir, f)
-            output_path = os.path.join(args.output_dir, f)
-            if process_image(input_path, output_path, reference_image, logger):
+            if process_image(os.path.join(args.input_dir, f), os.path.join(args.output_dir, f), reference_image, logger):
+                succ_img.add(f)
                 n += 1
 
+    successful_image_ids: set = {img['id'] for img in filt_imgs if img['file_name'] in succ_img}
+    successful_images: List[Dict[str, Any]] = [img for img in filt_imgs if img['file_name'] in succ_img]
+    successful_annotations: List[Dict[str, Any]] = [
+        anno for anno in filtered_annotations if anno['image_id'] in successful_image_ids
+    ]
+
+    new_coco: Dict[str, Any] = {
+        'info': coco_data.get('info', {}),
+        'licenses': coco_data.get('licenses', []),
+        'categories': coco_data.get('categories', []),
+        'images': successful_images,
+        'annotations': successful_annotations
+    }
+
+    output_coco_path = os.path.join(args.output_dir, '_annotations.coco.json')
+    with open(output_coco_path, 'w') as f:
+        json.dump(new_coco, f, indent=2)
+    logger.info(f"coco saved: {output_coco_path}")
     logger.info(f"finished. images: {n}")
 
 
