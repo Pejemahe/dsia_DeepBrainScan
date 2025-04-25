@@ -57,22 +57,61 @@ def apply_histogram_matching(
     except Exception as e:
         raise
 
-#3. orientation step
+
+# 2b. window intensity to separate bone peak
+
+def window_intensity(
+    image: sitk.Image,
+    win_min: float = 0.0,
+    win_max: float = 150.0,
+    out_min: float = 0.0,
+    out_max: float = 255.0
+) -> sitk.Image:
+    return sitk.IntensityWindowing(
+        image,
+        windowMinimum=win_min,
+        windowMaximum=win_max,
+        outputMinimum=out_min,
+        outputMaximum=out_max
+    )
+
+
+# 2c. CLAHE (contrast))
+
+def apply_clahe(
+    np_img: np.ndarray,
+    clip_limit: float = 2.0,
+    tile_grid_size: tuple = (8, 8)
+) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    return clahe.apply(np_img)
+
+
+# 2d. global adjustment
+
+def adjust_brightness_contrast(
+    np_img: np.ndarray,
+    alpha: float = 1.2,
+    beta: float = -10
+) -> np.ndarray:
+    return cv2.convertScaleAbs(np_img, alpha=alpha, beta=beta)
+
+
+# 3. Orientation step
+
 def correct_orientation(
     image: sitk.Image,
     logger: Optional[logging.Logger] = None
 ) -> sitk.Image:
-
     try:
         image_3d = sitk.JoinSeries([image])
         orienter = sitk.DICOMOrientImageFilter()
         orienter.SetDesiredCoordinateOrientation("RAS")
         oriented_3d = orienter.Execute(image_3d)
-        
         size_2d = oriented_3d.GetSize()[:2] + (0,)
         oriented_2d = sitk.Extract(oriented_3d, size_2d, (0, 0, 0))
         return oriented_2d
-    except Exception as e:
+    except Exception:
         raise
 
 #4. crop image
@@ -81,9 +120,11 @@ def crop_intracranial_region(
     original_size: tuple = (640, 640),
     logger: Optional[logging.Logger] = None
 ) -> sitk.Image:
-
     try:
         np_image = sitk.GetArrayFromImage(image)
+        # Flatten high-intensity bone peaks
+        mask_bone = np_image > 200
+        np_image[mask_bone] = 200
         np_image = cv2.normalize(np_image, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
 
         median = np.median(np_image)
@@ -132,17 +173,29 @@ def process_image(
         sitk_image = sitk.GetImageFromArray(original_image)
         sitk_image = sitk.Cast(sitk_image, sitk.sitkUInt8)
 
+        # N4 bias correction
         corrected = n4corr(sitk_image, logger)
 
+        # Histogram matching
         reference_slice = sitk.Extract(reference, reference.GetSize()[:2] + (0,), (0, 0, 0))
         matched = apply_histogram_matching(corrected, reference_slice, logger)
 
+        # Windowing to reduce bone influence
+        matched = window_intensity(matched, win_min=0, win_max=150, out_min=0, out_max=255)
+
+        # Orientation correction
         oriented = correct_orientation(matched, logger)
 
+        # Crop intracranial region
         cropped = crop_intracranial_region(oriented, original_size=original_image.shape, logger=logger)
 
+        # Convert back to array and normalize
         processed_array = sitk.GetArrayFromImage(cropped)
         processed_array = cv2.normalize(processed_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+
+        # Enhance local contrast and adjust brightness
+        processed_array = apply_clahe(processed_array, clip_limit=2.0, tile_grid_size=(8, 8))
+        processed_array = adjust_brightness_contrast(processed_array, alpha=1.2, beta=-10)
 
         cv2.imwrite(output_path, processed_array)
         return True
@@ -195,9 +248,9 @@ def main():
         with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
             futures = {}
             for f in input_files:
-                input_path = os.path.join(args.input_dir, f)
-                output_path = os.path.join(args.output_dir, f)
-                futures[executor.submit(process_image, input_path, output_path, reference_image, logger)] = f
+                in_path = os.path.join(args.input_dir, f)
+                out_path = os.path.join(args.output_dir, f)
+                futures[executor.submit(process_image, in_path, out_path, reference_image, logger)] = f
 
             for future in as_completed(futures):
                 file_name = futures[future]
@@ -206,10 +259,12 @@ def main():
                         succ_img.add(file_name)
                         n += 1
                 except Exception as e:
-                    logger.error(f"err proccess {file_name}: {str(e)}")
+                    logger.error(f"err processing {file_name}: {str(e)}")
     else:
         for f in input_files:
-            if process_image(os.path.join(args.input_dir, f), os.path.join(args.output_dir, f), reference_image, logger):
+            in_path = os.path.join(args.input_dir, f)
+            out_path = os.path.join(args.output_dir, f)
+            if process_image(in_path, out_path, reference_image, logger):
                 succ_img.add(f)
                 n += 1
 
